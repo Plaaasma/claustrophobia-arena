@@ -9,7 +9,17 @@
 // Runs as claustro-arena.service; state lives in the site DB so the web
 // server can serve /api/arena/* straight from tables.
 
+import { setDefaultResultOrder } from 'node:dns';
+import { setDefaultAutoSelectFamilyAttemptTimeout } from 'node:net';
 import { spawn } from 'node:child_process';
+
+// Remote-engine transport hygiene (diagnosed with the nmbf author 2026-08-11):
+// this host has NO global IPv6 route, so AAAA legs die instantly with
+// ENETUNREACH, and Node's Happy-Eyeballs default gives each address only
+// ~250ms to complete a TCP handshake — a cold anycast PoP loses that race.
+// Prefer v4 and give each connect attempt a real budget.
+setDefaultResultOrder('ipv4first');
+try { setDefaultAutoSelectFamilyAttemptTimeout(2500); } catch { /* older node */ }
 import { openSync, readFileSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import { createContext, runInContext } from 'node:vm';
@@ -19,7 +29,7 @@ import { dirname, join } from 'node:path';
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SITE = join(HERE, '..', 'site');
 const rules = await import(join(SITE, 'shared', 'rules.js').replace(/\\/g, '/'));
-const { initialState, replayMoves, allLegalMoves, isTerminal, winner, parseMove } = rules;
+const { initialState, replayMoves, allLegalMoves, isTerminal, winner, parseMove, pathDist } = rules;
 
 const DB_PATH = join(SITE, 'data', 'site.db');
 const db = new DatabaseSync(DB_PATH);
@@ -81,7 +91,9 @@ const ROSTER = [
 ];
 // per-engine concurrent-game caps = real parallel capacity: two native Ishtar
 // harnesses, two Ka servers, one Ka GPU server, a two-worker Sigma pool, four QBR CPU threads
-const LIMITS = { ishtar: 2, sigma: 2, sigma_gpu: 2, ka: 2, ka_gpu: 1, qbr: 4, claustro_v1: 2, claustro_cpu: 2, pathfinder: 2, scout: 2, sentinel: 2, kya: 2, kya_cpu: 2, nmbf: 1 };
+// caps must MATCH the engine-host pool sizes for hosted engines — an uncapped
+// scheduler seat 503s as "pool exhausted" (titanium/gorisanson bug 2026-08-12)
+const LIMITS = { ishtar: 2, sigma: 2, sigma_gpu: 2, ka: 2, ka_gpu: 1, qbr: 4, titanium: 2, gorisanson: 2, claustro_v1: 2, claustro_cpu: 2, pathfinder: 2, scout: 2, sentinel: 2, kya: 2, kya_cpu: 2, nmbf: 1 };
 for (const b of ROSTER) {
   db.prepare('INSERT INTO arena_bots (key, name, enabled) VALUES (?, ?, 1) ON CONFLICT(key) DO UPDATE SET name = excluded.name, enabled = 1')
     .run(b.key, b.name);
@@ -95,24 +107,43 @@ db.prepare("UPDATE arena_games SET status = 'void', reason = 'orchestrator resta
 // ---------------------------------------------------------------------------
 // Time management (orchestrator-side, used for every engine)
 
-function budgetMs(remaining) {
-  return Math.round(Math.max(150, Math.min(remaining * 0.3, remaining / 22 + INC_MS * 0.75)));
+// Derived clock rule (engine-project arena forensics 2026-08-12, verdict
+// §3.2): spend (rem - RESERVE) evenly over the estimated remaining moves,
+// never dip under RESERVE_HARD, degrade to the floor below the reserve
+// instead of orbiting a fixed point. Applies identically to every engine.
+const RESERVE_MS = 40_000;
+const RESERVE_HARD_MS = 3_000;
+const BUDGET_FLOOR_MS = 150;
+const BUDGET_CAP_MS = 15_000;
+function budgetMs(remaining, st = null) {
+  let movesLeft = 16;
+  if (st) {
+    try {
+      const d = Math.max(pathDist(st, 0), pathDist(st, 1));
+      movesLeft = Math.max(8, Math.min(30, d + 6));
+    } catch { /* estimator only */ }
+  }
+  const base = (remaining - RESERVE_MS) / movesLeft + INC_MS;
+  return Math.round(Math.max(BUDGET_FLOOR_MS, Math.min(base, BUDGET_CAP_MS, remaining - RESERVE_HARD_MS)));
 }
 
 // ---------------------------------------------------------------------------
 // Adapter: Claustrophobia (engined over HTTP; budget → sims via measured rate)
 
-// batched MCTS (MCGS reverted 2026-08-09 — not finished upstream; engined
-// keeps the env-gated mcgs path dormant). movetime rides along as a backstop.
-const CLAUSTRO_SIMS_PER_SEC = 2400;
-async function claustroMove(moves, budget) {
-  const sims = Math.max(200, Math.round((budget / 1000) * CLAUSTRO_SIMS_PER_SEC));
+// batched MCGS era (2026-08-12, upstream-finished): ~8k sims/s measured on
+// the shared server. sims is a ceiling; movetime governs.
+let claustroGpuRate = 6000; // sims/s EWMA — learns from realized simsRun
+async function claustroMove(moves, budget, clock) {
+  // F1 panic path (verdict §3.2 item 4): under 8s of clock, a near-policy
+  // move (~tens of ms) beats any search that might flag
+  const panic = (clock?.my_ms ?? Infinity) < 8_000;
+  const sims = panic ? 32 : Math.max(200, Math.round((budget / 1000) * claustroGpuRate * 1.5));
   const t0 = Date.now();
   // low lane: bot games must never queue a human's move behind them
-  const body = JSON.stringify({ moves: moves.join(' '), sims, movetime: Math.max(300, budget - 250), topK: 1, pvLen: 1, priority: 'low' });
+  const body = JSON.stringify({ moves: moves.join(' '), sims, movetime: panic ? 60 : Math.max(300, budget - 250), topK: 1, pvLen: 1, priority: 'low' });
   for (let attempt = 0; ; attempt++) {
     try {
-      const r = await fetch('http://127.0.0.1:9200/analyze', {
+      const r = await fetch(process.env.CLAUSTRO_ARENA_URL || 'http://169.254.152.37:9200/analyze', {
         method: 'POST', headers: { 'content-type': 'application/json' }, body,
         signal: AbortSignal.timeout(Math.max(5000, budget * 3)),
       });
@@ -121,6 +152,8 @@ async function claustroMove(moves, budget) {
       // engined value: 0..1 win prob unsolved, ±[-1,1] solved — fold to 0..1
       const v = j.value;
       const ev = typeof v === 'number' ? (v < 0 ? (v + 1) / 2 : Math.min(v, 1)) : null;
+      const dtg = Math.max(0.05, (Date.now() - t0) / 1000);
+      if (!panic && j.simsRun > 0) claustroGpuRate = 0.75 * claustroGpuRate + 0.25 * (j.simsRun / dtg);
       return { n: j.top?.[0]?.notation || j.bestmove, ev, nodes: j.simsRun ?? j.sims ?? sims, ms: Date.now() - t0 };
     } catch (e) {
       if (attempt >= 5) throw e;
@@ -217,7 +250,7 @@ function makeQbr() {
 // verified move-identical to the original WebGPU build at fixed node budgets.
 // Notation passes through untranslated: ours == the page's "official" notation.
 
-const ISHTAR_ENDPOINTS = (process.env.ISHTAR_BRIDGE || 'http://127.0.0.1:9720,http://127.0.0.1:9721')
+const ISHTAR_ENDPOINTS = (process.env.ISHTAR_BRIDGE || 'http://169.254.152.37:9720,http://169.254.152.37:9721')
   .split(',').map((url) => ({ url, busy: false }));
 async function ishtarMove(moves, budget) {
   const ep = ISHTAR_ENDPOINTS.find((e) => !e.busy) || ISHTAR_ENDPOINTS[0];
@@ -272,13 +305,14 @@ async function claustroV1Move(moves, budget) {
 // level-playing-field entry vs the alpha-beta engines. Rate self-calibrates.
 
 let claustroCpuRate = 250; // sims/sec EMA — measured ~265 at 2 threads (batched MCTS)
-async function claustroCpuMove(moves, budget) {
-  const sims = Math.max(100, Math.min(8000, Math.round((budget / 1000) * claustroCpuRate)));
-  const body = JSON.stringify({ moves: moves.join(' '), sims, movetime: Math.max(300, Math.round(budget) - 250), topK: 1, pvLen: 1 });
+async function claustroCpuMove(moves, budget, clock) {
+  const panic = (clock?.my_ms ?? Infinity) < 8_000; // F1: 176/177 forfeits were this seat
+  const sims = panic ? 24 : Math.max(48, Math.min(8000, Math.round((budget / 1000) * claustroCpuRate * 1.5)));
+  const body = JSON.stringify({ moves: moves.join(' '), sims, movetime: panic ? 60 : Math.max(300, Math.round(budget) - 250), topK: 1, pvLen: 1 });
   const t0 = Date.now();
   for (let attempt = 0; ; attempt++) {
     try {
-      const r = await fetch('http://127.0.0.1:9202/analyze', {
+      const r = await fetch(process.env.CLAUSTRO_CPU_ARENA_URL || 'http://169.254.152.37:9202/analyze', {
         method: 'POST', headers: { 'content-type': 'application/json' }, body,
         signal: AbortSignal.timeout(Math.round(budget) * 6 + 30_000),
       });
@@ -488,7 +522,7 @@ const sigmaGpuMove = (moves, budget) => sigmaMoveKind('gpu', moves, budget);
 // its own on :9715). Ka notation = pure vertical mirror of ours (proven by
 // conform.py): pawn rank r -> 10-r, wall rank r -> 9-r, files unchanged.
 
-const KA_ENDPOINTS = (process.env.KA_ARENA || 'http://127.0.0.1:9716/move,http://127.0.0.1:9717/move')
+const KA_ENDPOINTS = (process.env.KA_ARENA || 'http://169.254.152.37:9716/move,http://169.254.152.37:9717/move')
   .split(',').map((url) => ({ url, busy: false }));
 const kaFlip = (mv) => (mv.length === 2
   ? mv[0] + String(10 - Number(mv[1]))
@@ -522,7 +556,7 @@ async function kaMove(moves, budget) {
 
 // Ka GPU: same server code with the net swapped onto CUDA via onnx2torch
 // (claustro-ka-gpu.service :9718). Own rate EMA — measured ~590 n/s warm.
-const KA_GPU_URL = process.env.KA_GPU_ARENA || 'http://127.0.0.1:9718/move';
+const KA_GPU_URL = process.env.KA_GPU_ARENA || 'http://169.254.152.37:9718/move';
 let kaGpuBusy = false;
 let kaGpuRate = 400; // nodes/sec EMA — starts below measured warm speed
 async function kaGpuMove(moves, budget) {
@@ -622,13 +656,29 @@ const kyaMoveCpu = makeKyaAdapter(process.env.KYA_CPU_URL || 'http://169.254.152
 // budget multiple. Concurrency 1 per the author (contention hurts strength).
 
 const NMBF_URL = process.env.NMBF_URL // remote engine endpoint — set via env, never committed;
+// flatten a fetch failure into something diagnosable: undici buries the real
+// connect errors (code + syscall) inside .cause / AggregateError. No
+// addresses — these strings render publicly in game records.
+function describeFetchError(e) {
+  const parts = [];
+  const walk = (err) => {
+    if (!err) return;
+    if (Array.isArray(err.errors)) { err.errors.forEach(walk); return; }
+    parts.push([err.code, err.syscall].filter(Boolean).join(' ') || err.message);
+    if (err.cause) walk(err.cause);
+  };
+  walk(e.cause ?? e);
+  return [...new Set(parts)].slice(0, 4).join('; ') || e.message;
+}
 async function nmbfMove(moves, budget, clock) {
   const t0 = Date.now();
+  const attempts = [];
   // transport-level retries only (connect timeouts to their CDN edge happen);
   // an HTTP response with ok:false is the ENGINE speaking — no retry, that
   // would re-run a possibly non-idempotent search against their wishes
   for (let attempt = 0; ; attempt++) {
     let r;
+    const a0 = Date.now();
     try {
       r = await fetch(NMBF_URL, {
         method: 'POST', headers: { 'content-type': 'application/json' },
@@ -636,11 +686,19 @@ async function nmbfMove(moves, budget, clock) {
         signal: AbortSignal.timeout(Math.min((clock?.my_ms ?? budget * 3) + 5000, 120_000)),
       });
     } catch (e) {
-      if (attempt >= 2 || (clock?.my_ms ?? Infinity) < 20_000) throw e;
+      attempts.push(`try${attempt + 1} ${((Date.now() - a0) / 1000).toFixed(1)}s: ${describeFetchError(e)}`);
+      if (attempt >= 2 || (clock?.my_ms ?? Infinity) < 20_000) {
+        throw new Error(`nmbf transport — request never reached origin (${attempts.join(' | ')})`);
+      }
       await new Promise((ok) => setTimeout(ok, 1500));
       continue;
     }
-    const j = await r.json();
+    const text = await r.text();
+    let j;
+    try { j = JSON.parse(text); } catch {
+      // their CDN can answer with an HTML error page — record what it said
+      throw new Error(`nmbf: HTTP ${r.status} non-JSON reply: ${text.replace(/\s+/g, ' ').slice(0, 100)}`);
+    }
     if (!j.ok) throw new Error('nmbf: ' + (j.error || 'engine error'));
     const ev = typeof j.ev === 'number' ? Math.max(0, Math.min(1, j.ev)) : null;
     return { n: j.move, ev, nodes: j.nodes > 0 ? j.nodes : null, ms: Date.now() - t0 };
@@ -650,7 +708,30 @@ async function nmbfMove(moves, budget, clock) {
 // ---------------------------------------------------------------------------
 // Engine registry
 
+// Engines hosted on Spark 1 (engine-host.mjs) — Spark 2 keeps only the site
+// and the two Claustrophobia v2 instances (user directive 2026-08-11:
+// dedicate Spark 1 to everything else; site review was starving).
+const ENGINE_HOST = process.env.ENGINE_HOST || 'http://169.254.152.37:9800';
+function makeHosted(key) {
+  return {
+    async move(moves, budget, clock) {
+      const t0 = Date.now();
+      const r = await fetch(`${ENGINE_HOST}/move`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ key, moves, budget_ms: budget, clock }),
+        signal: AbortSignal.timeout(Math.round(budget) * 4 + 170_000), // must OUTLIVE the host's own engine timeouts (sigma watchdog 150s) so slots free before retries
+      });
+      const j = await r.json();
+      if (!j.ok) throw new Error(`${key}@host: ${j.error || 'engine error'}`);
+      return { n: j.move, ev: typeof j.ev === 'number' ? Math.max(0, Math.min(1, j.ev)) : null, nodes: j.nodes ?? null, ms: j.ms ?? null };
+    },
+    kill() {},
+  };
+}
+const HOSTED = new Set(['titanium', 'qbr', 'gorisanson', 'sigma', 'sigma_gpu', 'pathfinder', 'scout', 'sentinel']);
+
 function makeEngine(key) {
+  if (HOSTED.has(key)) return makeHosted(key);
   if (key === 'claustrophobia') return { move: claustroMove, kill() {} };
   if (key === 'titanium') return makeTitanium();
   if (key === 'gorisanson') return { move: gorisansonMove, kill() {} };
@@ -826,32 +907,46 @@ async function playGame(p0, p1, opening, pairTag) {
   const stats = moves.map(() => null); // per-ply {n: nodes, ms} from the mover
   const clocks = [BASE_MS, BASE_MS];
   const engines = [makeEngine(p0), makeEngine(p1)];
-  let winnerSide = null, reason = null;
+  let winnerSide = null, reason = null, culprit = null;
 
   try {
     for (let ply = moves.length; ply < MOVE_CAP; ply++) {
       const st = replayMoves(moves);
       if (isTerminal(st)) { winnerSide = winner(st); reason = 'goal'; break; }
       const side = st.side;
-      const budget = budgetMs(clocks[side]);
-      const t0 = Date.now();
-      let mv;
-      try {
-        mv = await Promise.race([
-          // third arg: true clock state — engines with native time management
-          // (remote nmbf; others ignore it) pace themselves from this
-          engines[side].move(moves, budget, { my_ms: Math.round(clocks[side]), opp_ms: Math.round(clocks[1 - side]), inc_ms: INC_MS }),
-          new Promise((_, rej) => setTimeout(() => rej(new Error('flag')), clocks[side] + 500)),
-        ]);
-      } catch (e) {
-        if (/flag/.test(e.message)) {
-          winnerSide = 1 - side; reason = 'time forfeit';
-        } else {
-          // infrastructure hiccup, not chess: nobody wins, nobody loses
-          winnerSide = null; reason = `engine failure (${e.message}) — drawn`;
+      const budget = budgetMs(clocks[side], st);
+      // engine failures get 3 attempts at the move, and a failed attempt's
+      // wall time is REFUNDED (t0 resets per attempt, so only the successful
+      // attempt is charged) — a network blip or worker respawn shouldn't
+      // decide a game. Flag falls stay immediate: the clock is the clock.
+      let mv = null;
+      let t0 = Date.now();
+      for (let tryN = 1; tryN <= 3; tryN++) {
+        t0 = Date.now();
+        try {
+          mv = await Promise.race([
+            // third arg: true clock state — engines with native time management
+            // (remote nmbf; others ignore it) pace themselves from this
+            engines[side].move(moves, budget, { my_ms: Math.round(clocks[side]), opp_ms: Math.round(clocks[1 - side]), inc_ms: INC_MS }),
+            new Promise((_, rej) => setTimeout(() => rej(new Error('flag')), clocks[side] + 500)),
+          ]);
+          break;
+        } catch (e) {
+          if (/flag/.test(e.message)) {
+            winnerSide = 1 - side; reason = 'time forfeit';
+            break;
+          }
+          if (tryN === 3) {
+            // infrastructure hiccup, not chess: nobody wins, nobody loses
+            winnerSide = null; reason = `engine failure after 3 tries (${e.message}) — drawn`;
+            culprit = side === 0 ? p0 : p1;
+            break;
+          }
+          console.log(`[arena] #${gid} ${side === 0 ? p0 : p1} move failed (try ${tryN}/3, time refunded): ${e.message}`);
+          await new Promise((ok) => setTimeout(ok, 2000));
         }
-        break;
       }
+      if (!mv) break; // forfeit or drawn above
       const n = mv.n;
       clocks[side] -= Date.now() - t0;
       if (clocks[side] <= 0) { winnerSide = 1 - side; reason = 'time forfeit'; break; }
@@ -877,9 +972,10 @@ async function playGame(p0, p1, opening, pairTag) {
   const res = winnerSide === null ? 0.5 : winnerSide === 0 ? 1 : 0;
   db.prepare("UPDATE arena_games SET status = 'done', winner = ?, reason = ?, moves = ?, evals = ?, stats = ?, clock0 = ?, clock1 = ?, ended_at = ? WHERE id = ?")
     .run(winnerSide, reason, moves.join(' '), JSON.stringify(evals), JSON.stringify(stats), clocks[0], clocks[1], Date.now(), gid);
-  applyCounts({ p0, p1 }, res);
   console.log(`[arena] #${gid} ${p0} vs ${p1} [${opening}] -> ${winnerSide === null ? 'draw' : winnerSide === 0 ? p0 : p1} (${reason}, ${moves.length} plies)`);
-  return { gid, p0, res };
+  // engine failure = infrastructure, not chess — the pair runner voids the
+  // whole pair so neither engine gains or loses anything from it
+  return { gid, p0, p1, res, failed: typeof reason === 'string' && reason.startsWith('engine failure'), culprit };
 }
 
 // ---------------------------------------------------------------------------
@@ -898,6 +994,26 @@ const OPENINGS = loadOpenings();
 // exact pair has played (in-flight included), tiebreak = engine totals.
 const pairKeyOf = (a, b) => (a < b ? `${a}|${b}` : `${b}|${a}`);
 const activePairs = {};
+// Repeated-failure bench. Voided pairs count for nothing in pairPlayed, so a
+// dead engine (endpoint down, container crashed) stays "most starved" and gets
+// re-seated the instant its pair voids — an infinite churn loop against a dead
+// backend. Two consecutive voided pairs blamed on the same engine bench it:
+// 10 min, doubling to a 60-min cap while it keeps failing, streak and bench
+// both reset on its next clean pair.
+const failStreak = {};
+const benchCount = {};
+const benchedUntil = {};
+const benched = (k) => (benchedUntil[k] || 0) > Date.now();
+function noteEngineFailure(k) {
+  failStreak[k] = (failStreak[k] || 0) + 1;
+  if (failStreak[k] < 2) return;
+  failStreak[k] = 0;
+  benchCount[k] = (benchCount[k] || 0) + 1;
+  const dur = Math.min(600_000 * 2 ** (benchCount[k] - 1), 3_600_000);
+  benchedUntil[k] = Date.now() + dur;
+  console.log(`[arena] ${k} benched for ${Math.round(dur / 60000)} min after repeated engine failures`);
+}
+function noteEngineOk(k) { failStreak[k] = 0; benchCount[k] = 0; }
 function pickJob() {
   const rows = db.prepare('SELECT key, games FROM arena_bots WHERE enabled = 1').all();
   const played = Object.fromEntries(rows.map((r) => [r.key, r.games + (activeN[r.key] || 0) * 2]));
@@ -911,7 +1027,7 @@ function pickJob() {
   for (let i = 0; i < keys.length; i++) {
     for (let j = i + 1; j < keys.length; j++) {
       const a = keys[i], b = keys[j];
-      if (atCap(a) || atCap(b)) continue;
+      if (atCap(a) || atCap(b) || benched(a) || benched(b)) continue;
       const pk = pairKeyOf(a, b);
       const pg = (pairPlayed[pk] || 0) + (activePairs[pk] || 0) * 2;
       const s = pg * 1000 + played[a] + played[b] + Math.random();
@@ -936,18 +1052,35 @@ async function slot(id) {
   for (;;) {
     const [a, b, op] = await nextJob();
     const tag = `${a}|${b}|${op}`;
-    const done = []; // finished games of this pair, scored from a's side
+    const done = []; // finished games of this pair
+    let pairBroken = false;
     try {
       const g1 = await playGame(a, b, op, tag);
       stampGameElo(g1.gid, a, b); // snapshot ratings at game 1's own position — update lands after game 2
-      done.push({ gid: g1.gid, p0: g1.p0, aScore: g1.res });
+      done.push(g1);
       const g2 = await playGame(b, a, op, tag);
-      done.push({ gid: g2.gid, p0: g2.p0, aScore: 1 - g2.res });
+      done.push(g2);
     } catch (e) {
       console.log(`[arena] slot ${id} job error: ${e.message}`);
+      pairBroken = true;
       await new Promise((ok) => setTimeout(ok, 5000));
     } finally {
-      try { applyPairElo(a, b, done); } catch (e) { console.log(`[arena] pair elo error: ${e.message}`); }
+      try {
+        if (pairBroken || done.some((g) => g.failed)) {
+          // an engine failure anywhere in the pair voids BOTH games: no Elo,
+          // no W/L/D — the opening pair gets naturally re-seated later
+          for (const g of done) {
+            db.prepare("UPDATE arena_games SET status = 'void', reason = reason || ' — pair voided' WHERE id = ?").run(g.gid);
+          }
+          if (done.length) console.log(`[arena] pair ${a} vs ${b} voided (engine failure)`);
+          const blame = done.find((g) => g.culprit)?.culprit;
+          if (blame) noteEngineFailure(blame);
+        } else {
+          for (const g of done) applyCounts({ p0: g.p0, p1: g.p1 }, g.res);
+          applyPairElo(a, b, done.map((g) => ({ gid: g.gid, p0: g.p0, aScore: g.p0 === a ? g.res : 1 - g.res })));
+          noteEngineOk(a); noteEngineOk(b);
+        }
+      } catch (e) { console.log(`[arena] pair settle error: ${e.message}`); }
       activeN[a]--; activeN[b]--;
       const pk = pairKeyOf(a, b);
       activePairs[pk] = Math.max(0, (activePairs[pk] || 0) - 1);
