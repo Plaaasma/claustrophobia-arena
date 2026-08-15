@@ -788,25 +788,40 @@ async function qbrProbe() {
 function colorForcedOpenings() {
   const banned = new Set();
   try {
+    // Two tests, because imbalance hides in strata: an opening can look fine
+    // across the whole field (weak bots misplay both sides, results vary) yet
+    // be fully decided among top engines — both just convert the favored
+    // color, every pair force-draws 1-1, and the top ratings compress. So on
+    // top of the all-field 40% split test, any opening where >half the pairs
+    // between two >=1900 engines are color-decided is banned ("I can beat
+    // stockfish if I start up a queen" — measuring conversion, not strength).
+    const TOP_ELO = 1900;
+    const elo = new Map(db.prepare('SELECT key, elo FROM arena_bots').all().map((r) => [r.key, r.elo]));
     const pend = new Map();
-    const stats = new Map(); // opening -> {pairs, colorSplits}
+    const stats = new Map(); // opening -> {pairs, colorSplits, topPairs, topSplits}
     for (const g of db.prepare(
       "SELECT p0, p1, opening, winner FROM arena_games WHERE status = 'done' AND opening != '' ORDER BY id").all()) {
       const k = [...[g.p0, g.p1].sort(), g.opening].join('|');
       if (!pend.has(k)) { pend.set(k, g); continue; }
       const g1 = pend.get(k);
       pend.delete(k);
-      const s = stats.get(g.opening) || { pairs: 0, colorSplits: 0 };
+      const s = stats.get(g.opening) || { pairs: 0, colorSplits: 0, topPairs: 0, topSplits: 0 };
+      const top = (elo.get(g.p0) ?? 0) >= TOP_ELO && (elo.get(g.p1) ?? 0) >= TOP_ELO;
       s.pairs++;
+      if (top) s.topPairs++;
       if (g1.winner !== null && g.winner !== null) {
         const win1 = g1.winner === 0 ? g1.p0 : g1.p1;
         const win2 = g.winner === 0 ? g.p0 : g.p1;
-        if (win1 !== win2 && g1.winner === g.winner) s.colorSplits++; // split, same seat won both
+        if (win1 !== win2 && g1.winner === g.winner) { // split, same seat won both
+          s.colorSplits++;
+          if (top) s.topSplits++;
+        }
       }
       stats.set(g.opening, s);
     }
     for (const [op, s] of stats) {
       if (s.pairs >= 6 && s.colorSplits / s.pairs > 0.4) banned.add(op);
+      else if (s.topPairs >= 5 && s.topSplits / s.topPairs > 0.5) banned.add(op);
     }
   } catch { /* first boot: no data yet */ }
   return banned;
