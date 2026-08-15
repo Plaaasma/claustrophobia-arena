@@ -828,7 +828,7 @@ function colorForcedOpenings() {
 }
 
 function loadOpenings() {
-  const TARGET = 28;
+  const TARGET = 32;
   const banned = colorForcedOpenings();
   const chosen = [];
   const famCount = {}; // cap near-identical siblings: max 2 per 5-ply family
@@ -842,6 +842,16 @@ function loadOpenings() {
     chosen.push(p);
   };
   if (banned.size) console.log(`[arena] opening filter: ${banned.size} color-forced openings excluded`);
+  // vetted book first: 6-ply lines the champion evals as colour-balanced
+  // (tools/arena_openings.txt, regenerated per champion) — the empirical ban
+  // list above still outranks it, since eval and practice occasionally differ
+  try {
+    for (const l of readFileSync(new URL('./arena_openings.txt', import.meta.url), 'utf8').trim().split('\n')) {
+      if (l.startsWith('#')) continue;
+      add(l.trim().split(/\s+/).slice(1).join(' '));
+    }
+    console.log(`[arena] vetted opening book: ${chosen.length} lines adopted`);
+  } catch { /* no vetted book — fall through to raw corpora */ }
   const bookPrefixes = (file, minCount) => {
     const counts = new Map();
     for (const l of readFileSync(file, 'utf8').trim().split('\n')) {

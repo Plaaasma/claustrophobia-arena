@@ -1,0 +1,67 @@
+# Arena opening book — engine-vetted for colour balance.
+# Generated 2026-08-15 vs champion b62c5f96 (v1.2.0), 6000 sims/line: kept
+# 6-ply lines with red win-prob in [0.30, 0.78] (race evals 0.73 and is the
+# best skill discriminator; >=0.80 or <=0.21 lines were opening-decided
+# among >=1900 engines). Sources: human/model books + engine-topK expansion.
+# Regenerate with gen_openings{,2}.mjs when the champion changes.
+# Format: red-winprob opening
+0.734 e2 e8 e3 e7 e4 e6
+0.403 e2 e8 e3 e7 e6h d7
+0.390 e2 e8 e3 e7 d6h f7
+0.513 e2 e8 e3 e7 f2h e6
+0.734 e2 e8 e3 e7 d6h d7
+0.302 e2 e8 e3 e7 e2h e6
+0.732 e2 e8 e3 e7 e6h f7
+0.403 e2 e8 e6h e7 e3 d7
+0.648 e2 e8 e3 d3h d7h f8
+0.639 e2 e8 d6h d2v e3 e3h
+0.382 e2 e8 e3 d3h d3 e7
+0.544 e2 e8 e3 e7 c2h e6
+0.387 e2 e8 e3 e3h f3 e7
+0.307 e2 e8 e3 e7 e2h e3h
+0.333 e2 e8 d7h d8 e3 c8
+0.657 e2 e8 e3 e3h e7h d8
+0.390 e2 e8 d6h e7 e3 f7
+0.742 e2 e8 e3 d3h d3 c2v
+0.592 a2h e8 e2 e7 e3 e6
+0.560 e2 e8 e3 e7 h2h e6
+0.529 e2 e8 e3 f8 e1v e3h
+0.529 e2 f9 e3 f8 e1v e3h
+0.527 e2 e8 f2 e7 d6h d7
+0.585 e2 f9 e3 g9 f3h d3h
+0.592 e2 e8 e3 e7 a2h e6
+0.503 e2 e8 d2 e7 d6h d3h
+0.503 d1 e8 d2 e7 d6h d3h
+0.613 e2 e8 e3 e7 h2h d7h
+0.623 e2 e8 e3 e7 f2h e3h
+0.624 e2 e8 e3 e7 c2h e7h
+0.474 e2 e8 d2 e7 e6h f7
+0.474 d1 e8 d2 e7 e6h f7
+0.630 e2 e8 e3 f8 h3h e3h
+0.630 e2 f9 e3 f8 h3h e3h
+0.631 e2 e8 e3 f8 g8h e8h
+0.631 e2 f9 e3 f8 g8h e8h
+0.634 e2 e8 e3 d8 a3h d3h
+0.635 e2 e8 e7h d8 e3 d9
+0.636 e2 e8 e3 e7 a2h e7h
+0.639 e2 e3h e3 d2v d6h e8
+0.641 e2 e8 d2 e7 d6h e8
+0.641 d1 e8 d2 e7 d6h e8
+0.643 e2 d3h f2 e8 f3v d8
+0.655 e2 e3h e3 e8 d6h d2v
+0.655 e2 e8 e3 e3h d6h d2v
+0.658 e2 d3h f2 e8 c3v e7
+0.658 e2 e8 e3 f8 h3h d3h
+0.658 e2 f9 e3 f8 h3h d3h
+0.660 e2 e3h d2 e8 f3v e7
+0.439 e2 e8 f2 e7 e6h e3h
+0.661 e2 e8 d7h f8 e3 f9
+0.661 e2 e8 f2 e7 e6h e8
+0.665 e2 d3h f2 e8 c3v d8
+0.675 e2 e3h e3 e8 h1h d2v
+0.675 e2 e8 e3 e3h h1h d2v
+0.676 e2 d3h e3 e8 a1h e7
+0.676 e2 e8 e3 d3h a1h e7
+0.423 e2 e8 e3 f8 g8h f7
+0.423 e2 f9 e3 f8 g8h f7
+0.678 e2 e3h d2 e8 a1h e7
