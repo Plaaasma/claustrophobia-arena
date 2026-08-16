@@ -134,24 +134,28 @@ function budgetMs(remaining, st = null) {
 // the shared server. sims is a ceiling; movetime governs.
 let claustroGpuRate = 6000; // sims/s EWMA — learns from realized simsRun
 async function claustroMove(moves, budget, clock) {
-  // F1 panic path (verdict §3.2 item 4): under 8s of clock, a near-policy
-  // move (~tens of ms) beats any search that might flag
-  const panic = (clock?.my_ms ?? Infinity) < 8_000;
+  // SERVER-SIDE TIME MANAGEMENT (QUORIDOR_TM=1 live 2026-08-16): with a valid
+  // clock the engine plans its own per-move time from the raw fields — the
+  // old caller-side sims ladder, movetime math and 8s panic path are retired
+  // on this path (the engine's own panic + implausible-clock tightening
+  // replace them). Legacy math kept only as the no-clock fallback.
+  const tmMode = Number.isFinite(clock?.my_ms) && clock.my_ms > 0;
+  const panic = !tmMode && (clock?.my_ms ?? Infinity) < 8_000;
   const sims = panic ? 32 : Math.max(200, Math.round((budget / 1000) * claustroGpuRate * 1.5));
   const t0 = Date.now();
   // low lane: bot games must never queue a human's move behind them
-  // raw clock passthrough (engine update 2026-08-16): engined's server-side
-  // time manager is env-gated and inert for now — once activated it takes
-  // over from the movetime/sims math above, which can then be retired
-  const body = JSON.stringify({
-    moves: moves.join(' '), sims, movetime: panic ? 60 : Math.max(300, budget - 250), topK: 1, pvLen: 1, priority: 'low',
-    ...(clock ? { remaining_ms: clock.my_ms, increment_ms: clock.inc_ms, overhead_ms: 120 } : {}),
-  });
+  const body = JSON.stringify(tmMode
+    ? {
+      moves: moves.join(' '), topK: 1, pvLen: 1, priority: 'low',
+      remaining_ms: Math.round(clock.my_ms), increment_ms: Math.round(clock.inc_ms || 0), overhead_ms: 120,
+    }
+    : { moves: moves.join(' '), sims, movetime: panic ? 60 : Math.max(300, budget - 250), topK: 1, pvLen: 1, priority: 'low' });
   for (let attempt = 0; ; attempt++) {
     try {
       const r = await fetch(process.env.CLAUSTRO_ARENA_URL || 'http://169.254.152.37:9200/analyze', {
         method: 'POST', headers: { 'content-type': 'application/json' }, body,
-        signal: AbortSignal.timeout(Math.max(5000, budget * 3)),
+        // TM's wall cap tops out at 60s — the timeout only guards a wedged server
+        signal: AbortSignal.timeout(tmMode ? 70_000 : Math.max(5000, budget * 3)),
       });
       const j = await r.json();
       if (!j.ok) throw new Error('analyze not ok');
@@ -159,7 +163,7 @@ async function claustroMove(moves, budget, clock) {
       const v = j.value;
       const ev = typeof v === 'number' ? (v < 0 ? (v + 1) / 2 : Math.min(v, 1)) : null;
       const dtg = Math.max(0.05, (Date.now() - t0) / 1000);
-      if (!panic && j.simsRun > 0) claustroGpuRate = 0.75 * claustroGpuRate + 0.25 * (j.simsRun / dtg);
+      if (!tmMode && !panic && j.simsRun > 0) claustroGpuRate = 0.75 * claustroGpuRate + 0.25 * (j.simsRun / dtg);
       return { n: j.top?.[0]?.notation || j.bestmove, ev, nodes: j.simsRun ?? j.sims ?? sims, ms: Date.now() - t0 };
     } catch (e) {
       if (attempt >= 5) throw e;
@@ -312,26 +316,29 @@ async function claustroV1Move(moves, budget) {
 
 let claustroCpuRate = 250; // sims/sec EMA — measured ~265 at 2 threads (batched MCTS)
 async function claustroCpuMove(moves, budget, clock) {
-  const panic = (clock?.my_ms ?? Infinity) < 8_000; // F1: 176/177 forfeits were this seat
+  // Server-side TM on this seat too (F1's 176/177 forfeits were HERE — the
+  // engine's clock-derived deadline + panic replace the caller-side guards).
+  const tmMode = Number.isFinite(clock?.my_ms) && clock.my_ms > 0;
+  const panic = !tmMode && (clock?.my_ms ?? Infinity) < 8_000;
   const sims = panic ? 24 : Math.max(48, Math.min(8000, Math.round((budget / 1000) * claustroCpuRate * 1.5)));
-  // raw clock passthrough — same contract as the GPU seat (inert until the
-  // engine's env gate flips; then this seat's sims math retires too)
-  const body = JSON.stringify({
-    moves: moves.join(' '), sims, movetime: panic ? 60 : Math.max(300, Math.round(budget) - 250), topK: 1, pvLen: 1,
-    ...(clock ? { remaining_ms: clock.my_ms, increment_ms: clock.inc_ms, overhead_ms: 120 } : {}),
-  });
+  const body = JSON.stringify(tmMode
+    ? {
+      moves: moves.join(' '), topK: 1, pvLen: 1,
+      remaining_ms: Math.round(clock.my_ms), increment_ms: Math.round(clock.inc_ms || 0), overhead_ms: 120,
+    }
+    : { moves: moves.join(' '), sims, movetime: panic ? 60 : Math.max(300, Math.round(budget) - 250), topK: 1, pvLen: 1 });
   const t0 = Date.now();
   for (let attempt = 0; ; attempt++) {
     try {
       const r = await fetch(process.env.CLAUSTRO_CPU_ARENA_URL || 'http://169.254.152.37:9202/analyze', {
         method: 'POST', headers: { 'content-type': 'application/json' }, body,
-        signal: AbortSignal.timeout(Math.round(budget) * 6 + 30_000),
+        signal: AbortSignal.timeout(tmMode ? 70_000 : Math.round(budget) * 6 + 30_000),
       });
       const j = await r.json();
       if (!j.ok) throw new Error('analyze not ok');
       const dt = Math.max(0.05, (Date.now() - t0) / 1000);
       // learn from what actually ran — the movetime cap means simsRun <= sims
-      claustroCpuRate = 0.7 * claustroCpuRate + 0.3 * ((j.simsRun ?? sims) / dt);
+      if (!tmMode) claustroCpuRate = 0.7 * claustroCpuRate + 0.3 * ((j.simsRun ?? sims) / dt);
       const v = j.value;
       const ev = typeof v === 'number' ? (v < 0 ? (v + 1) / 2 : Math.min(v, 1)) : null;
       return { n: j.top?.[0]?.notation || j.bestmove, ev, nodes: j.simsRun ?? j.sims ?? sims, ms: Date.now() - t0 };
