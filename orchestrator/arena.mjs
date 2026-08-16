@@ -140,7 +140,13 @@ async function claustroMove(moves, budget, clock) {
   const sims = panic ? 32 : Math.max(200, Math.round((budget / 1000) * claustroGpuRate * 1.5));
   const t0 = Date.now();
   // low lane: bot games must never queue a human's move behind them
-  const body = JSON.stringify({ moves: moves.join(' '), sims, movetime: panic ? 60 : Math.max(300, budget - 250), topK: 1, pvLen: 1, priority: 'low' });
+  // raw clock passthrough (engine update 2026-08-16): engined's server-side
+  // time manager is env-gated and inert for now — once activated it takes
+  // over from the movetime/sims math above, which can then be retired
+  const body = JSON.stringify({
+    moves: moves.join(' '), sims, movetime: panic ? 60 : Math.max(300, budget - 250), topK: 1, pvLen: 1, priority: 'low',
+    ...(clock ? { remaining_ms: clock.my_ms, increment_ms: clock.inc_ms, overhead_ms: 120 } : {}),
+  });
   for (let attempt = 0; ; attempt++) {
     try {
       const r = await fetch(process.env.CLAUSTRO_ARENA_URL || 'http://169.254.152.37:9200/analyze', {
@@ -308,7 +314,12 @@ let claustroCpuRate = 250; // sims/sec EMA — measured ~265 at 2 threads (batch
 async function claustroCpuMove(moves, budget, clock) {
   const panic = (clock?.my_ms ?? Infinity) < 8_000; // F1: 176/177 forfeits were this seat
   const sims = panic ? 24 : Math.max(48, Math.min(8000, Math.round((budget / 1000) * claustroCpuRate * 1.5)));
-  const body = JSON.stringify({ moves: moves.join(' '), sims, movetime: panic ? 60 : Math.max(300, Math.round(budget) - 250), topK: 1, pvLen: 1 });
+  // raw clock passthrough — same contract as the GPU seat (inert until the
+  // engine's env gate flips; then this seat's sims math retires too)
+  const body = JSON.stringify({
+    moves: moves.join(' '), sims, movetime: panic ? 60 : Math.max(300, Math.round(budget) - 250), topK: 1, pvLen: 1,
+    ...(clock ? { remaining_ms: clock.my_ms, increment_ms: clock.inc_ms, overhead_ms: 120 } : {}),
+  });
   const t0 = Date.now();
   for (let attempt = 0; ; attempt++) {
     try {
