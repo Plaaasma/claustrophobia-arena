@@ -70,7 +70,7 @@ try { db.exec('ALTER TABLE arena_games ADD COLUMN stats TEXT'); } catch {} // pe
 
 const ROSTER = [
   { key: 'claustrophobia', name: 'Claustrophobia v2' },
-  { key: 'titanium', name: 'Titanium v19.4.6' }, // commit 16c93b9 — endgame tablebase fires now
+  { key: 'titanium', name: 'Titanium v19.7.3' }, // faef87c — fixed movetime budget spend, eval cache 4-way, v17 session profile still current
   { key: 'gorisanson', name: 'Gorisanson 0.3' },
   { key: 'qbr', name: 'ACE QBR' }, // per the authors: neutral name, not "Ace One"
   { key: 'ishtar', name: 'ACE Ishtar 16' }, // claustro-ishnat*.service — native harness (extracted net + search, ORT CPU)
