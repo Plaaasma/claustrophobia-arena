@@ -70,7 +70,7 @@ try { db.exec('ALTER TABLE arena_games ADD COLUMN stats TEXT'); } catch {} // pe
 
 const ROSTER = [
   { key: 'claustrophobia', name: 'Claustrophobia v2' },
-  { key: 'titanium', name: 'Titanium v19.7.3' }, // faef87c — fixed movetime budget spend, eval cache 4-way, v17 session profile still current
+  { key: 'titanium', name: 'Titanium v19.8.2' }, // 12532da — ships gated champion net f430f608; repo says 19.8.2 (owner said 19.8.3)
   { key: 'gorisanson', name: 'Gorisanson 0.3' },
   { key: 'qbr', name: 'ACE QBR' }, // per the authors: neutral name, not "Ace One"
   { key: 'ishtar', name: 'ACE Ishtar 16' }, // claustro-ishnat*.service — native harness (extracted net + search, ORT CPU)
@@ -181,7 +181,11 @@ async function claustroMove(moves, budget, clock) {
 // author shipped). QBP protocol, persistent child per game seat. Owner asks
 // for ~200ms grace over the nominal budget, which our flag margin provides.
 
-const QBR_BIN_NATIVE = join(process.env.HOME, 'arena-engines', 'barrier-race', 'rust', 'target', 'release', 'qbr');
+const QBR_BIN_NATIVE = join(process.env.HOME, 'arena-engines', 'qbr-r4', 'rust', 'target', 'release', 'qbr');
+// gen_r4 net (2026-08-18 drop): blob + manifest MUST sit in the same dir; the
+// flags below are the authors' deployed champion config. Build verified against
+// their exact bench identity (nodes=329265 signature=816116888495200073).
+const QBR_NNUE = join(process.env.HOME, 'arena-engines', 'qbr-r4', 'gen_r4.qnn');
 function qbrStateOf(st) {
   const cell = ([r, c]) => String.fromCharCode(97 + c) + (r + 1);
   const slot = (s) => String.fromCharCode(97 + (s % 8)) + (Math.floor(s / 8) + 1);
@@ -191,7 +195,7 @@ function qbrStateOf(st) {
 // centipawn (side-to-move frame) -> rough win prob, chess-style logistic
 const cpToEv = (cp) => 1 / (1 + Math.pow(10, -cp / 400));
 function makeQbr() {
-  const child = spawn(QBR_BIN_NATIVE, ['qbp', '--tt-mb', '64', '--feature', 'threads=1'],
+  const child = spawn(QBR_BIN_NATIVE, ['qbp', '--feature', `nnue3=${QBR_NNUE}`, '--feature', 'wallq_tc=off', '--feature', 'rfp_margin=50', '--feature', 'threads=1'],
     { stdio: ['pipe', 'pipe', 'pipe'] });
   let buf = '';
   let ebuf = '';

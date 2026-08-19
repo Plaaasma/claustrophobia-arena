@@ -27,7 +27,11 @@ const INC_MS = 2_000;
 // author shipped). QBP protocol, persistent child per game seat. Owner asks
 // for ~200ms grace over the nominal budget, which our flag margin provides.
 
-const QBR_BIN_NATIVE = join(process.env.HOME, 'arena-engines', 'barrier-race', 'rust', 'target', 'release', 'qbr');
+const QBR_BIN_NATIVE = join(process.env.HOME, 'arena-engines', 'qbr-r4', 'rust', 'target', 'release', 'qbr');
+// gen_r4 net (2026-08-18 drop): blob + manifest MUST sit in the same dir; the
+// flags below are the authors' deployed champion config. Build verified against
+// their exact bench identity (nodes=329265 signature=816116888495200073).
+const QBR_NNUE = join(process.env.HOME, 'arena-engines', 'qbr-r4', 'gen_r4.qnn');
 function qbrStateOf(st) {
   const cell = ([r, c]) => String.fromCharCode(97 + c) + (r + 1);
   const slot = (s) => String.fromCharCode(97 + (s % 8)) + (Math.floor(s / 8) + 1);
@@ -37,7 +41,7 @@ function qbrStateOf(st) {
 // centipawn (side-to-move frame) -> rough win prob, chess-style logistic
 const cpToEv = (cp) => 1 / (1 + Math.pow(10, -cp / 400));
 function makeQbr() {
-  const child = spawn(QBR_BIN_NATIVE, ['qbp', '--tt-mb', '64', '--feature', 'threads=1'],
+  const child = spawn(QBR_BIN_NATIVE, ['qbp', '--feature', `nnue3=${QBR_NNUE}`, '--feature', 'wallq_tc=off', '--feature', 'rfp_margin=50', '--feature', 'threads=1'],
     { stdio: ['pipe', 'pipe', 'pipe'] });
   let buf = '';
   let ebuf = '';
@@ -400,7 +404,12 @@ function makeIshtar2() {
   const child = spawn('docker', [
     'run', '-i', '--rm', '--network', 'none', '--gpus', 'all',
     '--ipc=host', '--ulimit', 'memlock=-1:-1',
-    'optima-ishtar:arm64-gpu-v1',
+    // XLA-compiled model (3.7x: 1.1k -> ~4k evals/s at batch 64; TF-TRT was a
+    // regression). XLA needs a GB10-capable ptxas at runtime — the container's
+    // CUDA predates compute 12.1, so mount the host's CUDA 13 tools over it.
+    '-v', '/usr/local/cuda-13.0/bin/ptxas:/usr/local/cuda/bin/ptxas:ro',
+    '-v', '/usr/local/cuda-13.0/bin/nvlink:/usr/local/cuda/bin/nvlink:ro',
+    'optima-ishtar:arm64-gpu-xla-v1',
   ], { stdio: ['pipe', 'pipe', 'ignore'] });
   let buf = '';
   let onLine = null;
@@ -430,7 +439,7 @@ function makeIshtar2() {
     await waitFor((l) => (l === 'ugiok' ? l : null), 120_000);
     send('isready');
     await waitFor((l) => (l === 'readyok' ? l : null), 120_000);
-    send('setoption name parallelism value 64');
+    send('setoption name parallelism value 64') // measured: rate is parallelism-insensitive (~1.1k/s openings) — eval pipeline serializes upstream; 64 = proven-Elo config;
   })();
   let q = Promise.resolve(); // UGI is a serial protocol — one move at a time per child
   return {
