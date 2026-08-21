@@ -81,7 +81,7 @@ const ROSTER = [
   { key: 'sigma_gpu', name: 'SigmaQuoridor 321 GPU' }, // same net, CUDA + sim_batch_size 8 (~1.3k sims/s vs ~65 CPU)
   { key: 'ka_gpu', name: 'Ka GPU' }, // same net via onnx2torch on CUDA (claustro-ka-gpu.service :9718, ~2x CPU speed)
   { key: 'kya', name: 'Kya 188-249' }, // xwkya/quoridor-zi container (kya-gpu.service, 172.18.0.10:9040, ORT CUDA)
-  { key: 'kya_cpu', name: 'Kya 188-249 CPU' }, // same image, UseGpu=false + 4 threads (kya-cpu.service, 172.18.0.11:9040)
+  // kya_cpu removed 2026-08-20 (user) — kya-cpu.service stopped, Elo/history kept; re-add = restore this line + start kya-cpu.service
   { key: 'nmbf', name: 'nmbf v15' }, // REMOTE author-hosted endpoint (closed source); own time management from clock
   { key: 'ishtar2', name: 'Ishtar' }, // THE REAL ISHTAR — author's optima container (UGI over stdio, GB10 GPU inference; private weights), pooled on engine-host
   // house baseline bots — deliberately simple classical engines (~arena floor);
@@ -94,7 +94,7 @@ const ROSTER = [
 // harnesses, two Ka servers, one Ka GPU server, a two-worker Sigma pool, four QBR CPU threads
 // caps must MATCH the engine-host pool sizes for hosted engines — an uncapped
 // scheduler seat 503s as "pool exhausted" (titanium/gorisanson bug 2026-08-12)
-const LIMITS = { ishtar: 2, sigma: 2, sigma_gpu: 2, ka: 2, ka_gpu: 1, qbr: 4, titanium: 2, gorisanson: 2, claustro_v1: 2, claustro_cpu: 2, pathfinder: 2, scout: 2, sentinel: 2, kya: 2, kya_cpu: 2, nmbf: 1, ishtar2: 1 };
+const LIMITS = { ishtar: 2, sigma: 2, sigma_gpu: 2, ka: 2, ka_gpu: 1, qbr: 4, titanium: 2, gorisanson: 2, claustro_v1: 2, claustro_cpu: 2, pathfinder: 2, scout: 2, sentinel: 2, kya: 2, nmbf: 1, ishtar2: 1 };
 for (const b of ROSTER) {
   db.prepare('INSERT INTO arena_bots (key, name, enabled) VALUES (?, ?, 1) ON CONFLICT(key) DO UPDATE SET name = excluded.name, enabled = 1')
     .run(b.key, b.name);
