@@ -66,7 +66,8 @@ CREATE INDEX IF NOT EXISTS idx_arena_games_status ON arena_games(status);
 `);
 try { db.exec('ALTER TABLE arena_games ADD COLUMN evals TEXT'); } catch {} // one eval per ply, p0 POV, null = engine gave none
 try { db.exec('ALTER TABLE arena_games ADD COLUMN moved_at INTEGER'); } catch {} // when the side to move started thinking — clients tick clocks from this
-try { db.exec('ALTER TABLE arena_games ADD COLUMN stats TEXT'); } catch {} // per-ply {n: nodes/sims, ms} from the engine that moved, null = book/none
+try { db.exec('ALTER TABLE arena_games ADD COLUMN stats TEXT'); } catch {}
+try { db.exec('ALTER TABLE arena_bots ADD COLUMN offline INTEGER NOT NULL DEFAULT 0'); } catch {} // repeated-bench engines: greyed + labeled on the site; a camped rating must be visibly unbeatable-by-absence // per-ply {n: nodes/sims, ms} from the engine that moved, null = book/none
 
 const ROSTER = [
   { key: 'claustrophobia', name: 'Claustrophobia v2' },
@@ -1092,8 +1093,17 @@ function noteEngineFailure(k) {
   const dur = Math.min(600_000 * 2 ** (benchCount[k] - 1), 3_600_000);
   benchedUntil[k] = Date.now() + dur;
   console.log(`[arena] ${k} benched for ${Math.round(dur / 60000)} min after repeated engine failures`);
+  if ((benchCount[k] || 0) >= 2) {
+    // second consecutive bench = genuinely down, not a blip — surface it on
+    // the site (grey + "offline"): a camped rating must be visibly frozen
+    try { db.prepare('UPDATE arena_bots SET offline = 1 WHERE key = ?').run(k); } catch { /* old schema */ }
+  }
 }
-function noteEngineOk(k) { failStreak[k] = 0; benchCount[k] = 0; }
+function noteEngineOk(k) {
+  failStreak[k] = 0;
+  benchCount[k] = 0;
+  try { db.prepare('UPDATE arena_bots SET offline = 0 WHERE key = ? AND offline = 1').run(k); } catch { /* old schema */ }
+}
 function pickJob() {
   const rows = db.prepare('SELECT key, games FROM arena_bots WHERE enabled = 1').all();
   const played = Object.fromEntries(rows.map((r) => [r.key, r.games + (activeN[r.key] || 0) * 2]));
