@@ -85,7 +85,7 @@ const ROSTER = [
   // kya_cpu removed 2026-08-20 (user) — kya-cpu.service stopped, Elo/history kept; re-add = restore this line + start kya-cpu.service
   { key: 'nmbf', name: 'nmbf v15' }, // REMOTE author-hosted endpoint (closed source); own time management from clock
   { key: 'ishtar2', name: 'Ishtar' }, // THE REAL ISHTAR — author's optima container (UGI over stdio, GB10 GPU inference; private weights), pooled on engine-host
-  { key: 'ace_kya', name: 'ACE Kya' }, // se24 python MCTS (spark1 engine-host pool; shipping-default config, own mtg=24 clocking; NO eval by user request)
+  { key: 'ace_kya', name: 'ACE Kya' }, // se24-cpu arena_server (author's HTTP server :9750, CPU by design, own book + clocking; NO eval by user request)
   // house baseline bots — deliberately simple classical engines (~arena floor);
   // deterministic, so variety comes entirely from the opening pairs
   { key: 'pathfinder', name: 'Greedy Racer' }, // shortest-path racer + reactive walls
@@ -753,7 +753,24 @@ function makeHosted(key) {
     kill() {},
   };
 }
-const HOSTED = new Set(['titanium', 'qbr', 'gorisanson', 'sigma', 'sigma_gpu', 'pathfinder', 'scout', 'sentinel', 'ishtar2', 'ace_kya']);
+const HOSTED = new Set(['titanium', 'qbr', 'gorisanson', 'sigma', 'sigma_gpu', 'pathfinder', 'scout', 'sentinel', 'ishtar2']);
+
+// ---------------------------------------------------------------------------
+// Adapter: ACE Kya (se24-cpu arena_server.py — the author's own HTTP server
+// speaking our wire protocol; CPU by the author's design, with their opening
+// book + adaptive 2:50+2 clocking). ev is deliberately DROPPED: the seat runs
+// without an eval bar (user request).
+const ACE_KYA_URL = process.env.ACE_KYA_URL || 'http://169.254.152.37:9750/';
+async function aceKyaMove(moves, budget, clock) {
+  const r = await fetch(ACE_KYA_URL, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ moves, budget_ms: budget, clock }),
+    signal: AbortSignal.timeout(budget * 3 + 30_000),
+  });
+  const j = await r.json();
+  if (!j.ok) throw new Error(`ace_kya: ${j.error || 'server error'}`);
+  return { n: j.move, ev: null, nodes: j.nodes ?? null, ms: j.ms ?? null };
+}
 
 function makeEngine(key) {
   if (HOSTED.has(key)) return makeHosted(key);
@@ -772,6 +789,7 @@ function makeEngine(key) {
   if (key === 'kya') return { move: kyaMoveGpu, kill() {} };
   if (key === 'kya_cpu') return { move: kyaMoveCpu, kill() {} };
   if (key === 'nmbf') return { move: nmbfMove, kill() {} };
+  if (key === 'ace_kya') return { move: aceKyaMove, kill() {} };
   throw new Error(`unknown bot ${key}`);
 }
 

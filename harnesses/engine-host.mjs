@@ -485,6 +485,48 @@ function makeIshtar2() {
 }
 
 // ---------------------------------------------------------------------------
+// ACE Kya (se24) — python MCTS around the se24-selfplay net, JSON lines on
+// stdio. Shipping defaults from its README (measured, not guessed): MCGS
+// class with graph off, eps 0.06, act=grill, terminal solver + race
+// tablebase. It does its own clock budgeting (mtg=24) from the clock we
+// pass. NO ev is returned by design — the seat runs without an eval bar.
+function makeAceKya() {
+  const child = spawn('python3', ['se24_server.py'], {
+    cwd: join(process.env.HOME, 'arena-engines', 'se24'),
+    stdio: ['pipe', 'pipe', 'ignore'],
+  });
+  let buf = '';
+  const waiters = [];
+  child.stdout.on('data', (d) => {
+    buf += d.toString();
+    let idx;
+    while ((idx = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, idx).trim();
+      buf = buf.slice(idx + 1);
+      if (!line) continue;
+      const w = waiters.shift();
+      if (!w) continue;
+      try { w.resolve(JSON.parse(line)); } catch (e) { w.reject(e); }
+    }
+  });
+  child.on('exit', () => { for (const w of waiters.splice(0)) w.reject(new Error('ace_kya exited')); });
+  return {
+    child,
+    async move(moves, budget, clock) {
+      const j = await new Promise((resolve, reject) => {
+        waiters.push({ resolve, reject });
+        child.stdin.write(JSON.stringify({ moves, budget_ms: budget, clock }) + '\n');
+        // first request rides the torch/CUDA model load (~20s cold)
+        setTimeout(() => reject(new Error('ace_kya timeout')), budget * 3 + 60_000);
+      });
+      if (!j.ok) throw new Error(`ace_kya: ${j.error}`);
+      return { n: j.move, ev: null, nodes: j.nodes ?? null, ms: j.ms ?? null };
+    },
+    kill() { try { child.kill(); } catch { /* gone */ } },
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Instance pools + HTTP front
 
 // caps = arena LIMITS + 1 headroom: a slow move can outlive the
