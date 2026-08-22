@@ -86,6 +86,7 @@ const ROSTER = [
   { key: 'nmbf', name: 'nmbf v15' }, // REMOTE author-hosted endpoint (closed source); own time management from clock
   { key: 'ishtar2', name: 'Ishtar' }, // THE REAL ISHTAR — author's optima container (UGI over stdio, GB10 GPU inference; private weights), pooled on engine-host
   { key: 'ace_kya', name: 'ACE Kya' }, // se24-cpu arena_server (author's HTTP server :9750, CPU by design, own book + clocking; NO eval by user request)
+  { key: 'zquoridor', name: 'Zquoridor' }, // gitzambrano/zquoridor — C++ AB+NNUE gen5 via QTP (engine-host pool; vertical-mirror notation)
   // house baseline bots — deliberately simple classical engines (~arena floor);
   // deterministic, so variety comes entirely from the opening pairs
   { key: 'pathfinder', name: 'Greedy Racer' }, // shortest-path racer + reactive walls
@@ -96,7 +97,7 @@ const ROSTER = [
 // harnesses, two Ka servers, one Ka GPU server, a two-worker Sigma pool, four QBR CPU threads
 // caps must MATCH the engine-host pool sizes for hosted engines — an uncapped
 // scheduler seat 503s as "pool exhausted" (titanium/gorisanson bug 2026-08-12)
-const LIMITS = { ishtar: 2, sigma: 2, sigma_gpu: 2, ka: 2, ka_gpu: 1, qbr: 4, titanium: 2, gorisanson: 2, claustro_v1: 2, claustro_cpu: 2, pathfinder: 2, scout: 2, sentinel: 2, kya: 2, nmbf: 1, ishtar2: 1, ace_kya: 1 };
+const LIMITS = { ishtar: 2, sigma: 2, sigma_gpu: 2, ka: 2, ka_gpu: 1, qbr: 4, titanium: 2, gorisanson: 2, claustro_v1: 2, claustro_cpu: 2, pathfinder: 2, scout: 2, sentinel: 2, kya: 2, nmbf: 1, ishtar2: 1, ace_kya: 1, zquoridor: 2 };
 for (const b of ROSTER) {
   db.prepare('INSERT INTO arena_bots (key, name, enabled) VALUES (?, ?, 1) ON CONFLICT(key) DO UPDATE SET name = excluded.name, enabled = 1')
     .run(b.key, b.name);
@@ -753,7 +754,7 @@ function makeHosted(key) {
     kill() {},
   };
 }
-const HOSTED = new Set(['titanium', 'qbr', 'gorisanson', 'sigma', 'sigma_gpu', 'pathfinder', 'scout', 'sentinel', 'ishtar2']);
+const HOSTED = new Set(['titanium', 'qbr', 'gorisanson', 'sigma', 'sigma_gpu', 'pathfinder', 'scout', 'sentinel', 'ishtar2', 'zquoridor']);
 
 // ---------------------------------------------------------------------------
 // Adapter: ACE Kya (se24-cpu arena_server.py — the author's own HTTP server

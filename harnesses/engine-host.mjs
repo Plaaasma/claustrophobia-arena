@@ -527,6 +527,67 @@ function makeAceKya() {
 }
 
 // ---------------------------------------------------------------------------
+// Zquoridor (github.com/gitzambrano/zquoridor) — C++17 alpha-beta + int8 NNUE
+// via its QTP text frontend (single-token notation like ours). VERTICAL
+// MIRROR: their first mover ("black") starts at e9 heading DOWN — pawn rank
+// r <-> 10-r, wall rank r <-> 9-r, files unchanged (verified by board
+// render). The mirror is its own inverse.
+const toZq = (m) => (m.length === 3 ? `${m[0]}${9 - Number(m[1])}${m[2]}` : `${m[0]}${10 - Number(m[1])}`);
+function makeZquoridor() {
+  const child = spawn(join(process.env.HOME, 'arena-engines', 'zquoridor', 'bin', 'qtp_engine'),
+    [join(process.env.HOME, 'arena-engines', 'zquoridor', 'data', 'nnue', 'nnue_weights_int8.bin'), '40', '200'],
+    { cwd: join(process.env.HOME, 'arena-engines', 'zquoridor'), stdio: ['pipe', 'pipe', 'ignore'] });
+  let buf = '';
+  let onReply = null;
+  child.stdout.on('data', (d) => {
+    buf += d.toString();
+    let idx;
+    while ((idx = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, idx).trim();
+      buf = buf.slice(idx + 1);
+      if (!line || !onReply) continue;
+      if (line.startsWith('=') || line.startsWith('?')) onReply(line);
+    }
+  });
+  let dead = false;
+  child.on('exit', () => { dead = true; if (onReply) onReply('? engine exited'); });
+  const cmd = (c, ms = 10_000) => new Promise((resolve, reject) => {
+    if (dead) return reject(new Error('zquoridor exited'));
+    const t = setTimeout(() => { onReply = null; reject(new Error('zquoridor timeout')); }, ms);
+    onReply = (line) => {
+      clearTimeout(t);
+      onReply = null;
+      if (line.startsWith('?')) reject(new Error(`zquoridor: ${line.slice(1).trim() || 'error'}`));
+      else resolve(line.slice(1).trim());
+    };
+    child.stdin.write(c + '\n');
+  });
+  let q = Promise.resolve(); // QTP is serial — one command stream per child
+  return {
+    child,
+    async move(moves, budget) {
+      const run = async () => {
+        const t0 = Date.now();
+        await cmd('clear_board');
+        for (let i = 0; i < moves.length; i++) {
+          const color = i % 2 === 0 ? 'b' : 'w';
+          const m = moves[i];
+          await cmd(`${m.length === 3 ? 'playwall' : 'playmove'} ${color} ${toZq(m)}`);
+        }
+        await cmd(`level 40 ${Math.max(100, Math.round(budget) - 150)}`);
+        const tok = await cmd(`genmove ${moves.length % 2 === 0 ? 'b' : 'w'}`, budget * 3 + 20_000);
+        if (!tok) throw new Error('zquoridor: empty genmove');
+        return { n: toZq(tok), ev: null, nodes: null, ms: Date.now() - t0 };
+      };
+      const p = q.then(run, run);
+      q = p.catch(() => {});
+      return p;
+    },
+    kill() { try { child.stdin.write('quit' + '\n'); } catch { /* dead */ } try { child.kill(); } catch { /* gone */ } },
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Instance pools + HTTP front
 
 // caps = arena LIMITS + 1 headroom: a slow move can outlive the
@@ -539,6 +600,7 @@ const POOLED = {
   sigma: { cap: 3, make: () => ({ move: sigmaMove, kill() {} }) },
   sigma_gpu: { cap: 3, make: () => ({ move: sigmaGpuMove, kill() {} }) },
   ishtar2: { cap: 2, make: makeIshtar2 },
+  zquoridor: { cap: 3, make: makeZquoridor },
   pathfinder: { cap: 3, make: () => makeSimple('pathfinder') },
   scout: { cap: 3, make: () => makeSimple('scout') },
   sentinel: { cap: 3, make: () => makeSimple('sentinel') },
