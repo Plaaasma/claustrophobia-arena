@@ -84,6 +84,7 @@ const ROSTER = [
   // kya_cpu removed 2026-08-20 (user) — kya-cpu.service stopped, Elo/history kept; re-add = restore this line + start kya-cpu.service
   { key: 'nmbf', name: 'nmbf v15' }, // REMOTE author-hosted endpoint (closed source); own time management from clock
   { key: 'ishtar2', name: 'Ishtar' }, // THE REAL ISHTAR — author's optima container (UGI over stdio, GB10 GPU inference; private weights), pooled on engine-host
+  { key: 'ace_kya', name: 'ACE Kya' }, // se24 python MCTS (spark1 engine-host pool; shipping-default config, own mtg=24 clocking; NO eval by user request)
   // house baseline bots — deliberately simple classical engines (~arena floor);
   // deterministic, so variety comes entirely from the opening pairs
   { key: 'pathfinder', name: 'Greedy Racer' }, // shortest-path racer + reactive walls
@@ -94,7 +95,7 @@ const ROSTER = [
 // harnesses, two Ka servers, one Ka GPU server, a two-worker Sigma pool, four QBR CPU threads
 // caps must MATCH the engine-host pool sizes for hosted engines — an uncapped
 // scheduler seat 503s as "pool exhausted" (titanium/gorisanson bug 2026-08-12)
-const LIMITS = { ishtar: 2, sigma: 2, sigma_gpu: 2, ka: 2, ka_gpu: 1, qbr: 4, titanium: 2, gorisanson: 2, claustro_v1: 2, claustro_cpu: 2, pathfinder: 2, scout: 2, sentinel: 2, kya: 2, nmbf: 1, ishtar2: 1 };
+const LIMITS = { ishtar: 2, sigma: 2, sigma_gpu: 2, ka: 2, ka_gpu: 1, qbr: 4, titanium: 2, gorisanson: 2, claustro_v1: 2, claustro_cpu: 2, pathfinder: 2, scout: 2, sentinel: 2, kya: 2, nmbf: 1, ishtar2: 1, ace_kya: 1 };
 for (const b of ROSTER) {
   db.prepare('INSERT INTO arena_bots (key, name, enabled) VALUES (?, ?, 1) ON CONFLICT(key) DO UPDATE SET name = excluded.name, enabled = 1')
     .run(b.key, b.name);
@@ -751,7 +752,7 @@ function makeHosted(key) {
     kill() {},
   };
 }
-const HOSTED = new Set(['titanium', 'qbr', 'gorisanson', 'sigma', 'sigma_gpu', 'pathfinder', 'scout', 'sentinel', 'ishtar2']);
+const HOSTED = new Set(['titanium', 'qbr', 'gorisanson', 'sigma', 'sigma_gpu', 'pathfinder', 'scout', 'sentinel', 'ishtar2', 'ace_kya']);
 
 function makeEngine(key) {
   if (HOSTED.has(key)) return makeHosted(key);
@@ -828,7 +829,7 @@ function colorForcedOpenings() {
       if (!pend.has(k)) { pend.set(k, g); continue; }
       const g1 = pend.get(k);
       pend.delete(k);
-      const s = stats.get(g.opening) || { pairs: 0, colorSplits: 0, topPairs: 0, topSplits: 0 };
+      const s = stats.get(g.opening) || { pairs: 0, colorSplits: 0, topPairs: 0, topSplits: 0, losers: new Set(), topLosers: new Set() };
       const top = (elo.get(g.p0) ?? 0) >= TOP_ELO && (elo.get(g.p1) ?? 0) >= TOP_ELO;
       s.pairs++;
       if (top) s.topPairs++;
@@ -837,21 +838,26 @@ function colorForcedOpenings() {
         const win2 = g.winner === 0 ? g.p0 : g.p1;
         if (win1 !== win2 && g1.winner === g.winner) { // split, same seat won both
           s.colorSplits++;
-          if (top) s.topSplits++;
+          // who lost the disadvantaged colour — a ban needs this to happen to
+          // SEVERAL different engines, or one engine throwing a colour could
+          // delete any opening it dislikes (exploit report 2026-08-22)
+          const lose1 = g1.winner === 0 ? g1.p1 : g1.p0;
+          s.losers.add(lose1);
+          if (top) { s.topSplits++; s.topLosers.add(lose1); }
         }
       }
       stats.set(g.opening, s);
     }
     for (const [op, s] of stats) {
-      if (s.pairs >= 6 && s.colorSplits / s.pairs > 0.4) banned.add(op);
-      else if (s.topPairs >= 5 && s.topSplits / s.topPairs > 0.5) banned.add(op);
+      if (s.pairs >= 6 && s.colorSplits / s.pairs > 0.4 && s.losers.size >= 3) banned.add(op);
+      else if (s.topPairs >= 5 && s.topSplits / s.topPairs > 0.5 && s.topLosers.size >= 2) banned.add(op);
     }
   } catch { /* first boot: no data yet */ }
   return banned;
 }
 
 function loadOpenings() {
-  const TARGET = 32;
+  const TARGET = 64; // full vetted pool — jobs sample from all of it, so book preparation has ~2x the surface and per-restart rotation no longer pins 32 fixed lines
   const banned = colorForcedOpenings();
   const chosen = [];
   const famCount = {}; // cap near-identical siblings: max 2 per 5-ply family
@@ -985,9 +991,32 @@ async function playGame(p0, p1, opening, pairTag) {
             break;
           }
           if (tryN === 3) {
-            // infrastructure hiccup, not chess: nobody wins, nobody loses
-            winnerSide = null; reason = `engine failure after 3 tries (${e.message}) — drawn`;
+            // ADJUDICATION (exploit report 2026-08-22): a losing engine that
+            // "crashes" used to convert the loss into a voided pair — free
+            // loss-laundering. If the POSITION (never self-reported evals) is
+            // clearly decided against the erroring side, score it as a loss;
+            // only genuinely unclear positions still void. Thresholds are
+            // conservative: a 5-step path deficit, or the opponent within two
+            // steps of goal and ahead, is not coming back at engine level.
             culprit = side === 0 ? p0 : p1;
+            let adjudicated = false;
+            try {
+              const pdMe = pathDist(st, side);
+              const pdOpp = pathDist(st, 1 - side);
+              if (pdMe - pdOpp >= 5 || (pdOpp <= 2 && pdMe - pdOpp >= 2)) {
+                winnerSide = 1 - side;
+                reason = `engine failure (${e.message}) — adjudicated loss (paths ${pdMe} vs ${pdOpp})`;
+                adjudicated = true;
+              }
+            } catch { /* pathDist on a corrupt state — fall through to void */ }
+            if (!adjudicated) {
+              // correlation trail: the erroring side's own last reported eval.
+              // A clean engine errors independently of whether it is winning —
+              // a pattern of losing-position errors shows up right here.
+              const lastOwn = [...evals].reverse().find((v, i) => v !== null && (evals.length - 1 - i) % 2 === side);
+              const evNote = lastOwn == null ? '' : ` [errer last self-ev ${side === 0 ? lastOwn : Math.round((1 - lastOwn) * 1000) / 1000}]`;
+              winnerSide = null; reason = `engine failure after 3 tries (${e.message}) — drawn${evNote}`;
+            }
             break;
           }
           console.log(`[arena] #${gid} ${side === 0 ? p0 : p1} move failed (try ${tryN}/3, time refunded): ${e.message}`);
@@ -1004,7 +1033,10 @@ async function playGame(p0, p1, opening, pairTag) {
       moves.push(n);
       // store from side-0's perspective so the graph reads one way up
       evals.push(mv.ev == null ? null : Math.round((side === 0 ? mv.ev : 1 - mv.ev) * 1000) / 1000);
-      stats.push(mv.nodes != null ? { n: mv.nodes, ms: mv.ms ?? null } : null);
+      // cms = wall time the ARENA charged (includes transport/queue) vs the
+      // engine's self-reported ms — published so authors can tell "we were
+      // slow" from "it sat in a queue" (exploit report 2026-08-22 item 5)
+      stats.push({ n: mv.nodes ?? null, ms: mv.ms ?? null, cms: Date.now() - t0 });
       db.prepare('UPDATE arena_games SET moves = ?, evals = ?, stats = ?, clock0 = ?, clock1 = ?, moved_at = ? WHERE id = ?')
         .run(moves.join(' '), JSON.stringify(evals), JSON.stringify(stats), clocks[0], clocks[1], Date.now(), gid);
     }
@@ -1023,7 +1055,7 @@ async function playGame(p0, p1, opening, pairTag) {
   console.log(`[arena] #${gid} ${p0} vs ${p1} [${opening}] -> ${winnerSide === null ? 'draw' : winnerSide === 0 ? p0 : p1} (${reason}, ${moves.length} plies)`);
   // engine failure = infrastructure, not chess — the pair runner voids the
   // whole pair so neither engine gains or loses anything from it
-  return { gid, p0, p1, res, failed: typeof reason === 'string' && reason.startsWith('engine failure'), culprit };
+  return { gid, p0, p1, res, failed: typeof reason === 'string' && reason.startsWith('engine failure') && !reason.includes('adjudicated'), culprit };
 }
 
 // ---------------------------------------------------------------------------
