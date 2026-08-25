@@ -509,7 +509,7 @@ function sigmaWorker(kind) {
   for (let i = pool.length - 1; i >= 0; i--) if (pool[i].child.exitCode !== null) pool.splice(i, 1);
   return pool.find((s) => !s.busy) || sigmaSpawn(kind);
 }
-async function sigmaMoveKind(kind, moves, budget) {
+async function sigmaMoveKind(kind, moves, budget, clock) {
   const s = sigmaWorker(kind);
   s.busy = true;
   try {
@@ -519,7 +519,15 @@ async function sigmaMoveKind(kind, moves, budget) {
         resolve: (v) => { settled = true; resolve(v); },
         reject: (e) => { settled = true; reject(e); },
       });
-      s.child.stdin.write(JSON.stringify({ moves, budget_ms: Math.max(300, Math.round(budget) - 200) }) + '\n');
+      // sigma checks the wall clock per CHUNK, so its overshoot is one chunk
+      // of a starved search (up to the 120s watchdog). Ask for less than the
+      // budget and never stake more than half the bank above the reserve, so
+      // an overshoot lands inside the clock instead of on the flag.
+      const bankMs = Number.isFinite(clock?.my_ms)
+        ? Math.max(300, (clock.my_ms - RESERVE_MS) * 0.5)
+        : Infinity;
+      const askMs = Math.min(Math.max(300, Math.round(budget) - 200), bankMs, MOVE_CEILING_MS);
+      s.child.stdin.write(JSON.stringify({ moves, budget_ms: Math.round(askMs) }) + '\n');
       setTimeout(() => {
         if (settled) return;
         reject(new Error('sigma timeout'));
@@ -539,8 +547,8 @@ async function sigmaMoveKind(kind, moves, budget) {
     s.busy = false;
   }
 }
-const sigmaMove = (moves, budget) => sigmaMoveKind('cpu', moves, budget);
-const sigmaGpuMove = (moves, budget) => sigmaMoveKind('gpu', moves, budget);
+const sigmaMove = (moves, budget, clock) => sigmaMoveKind('cpu', moves, budget, clock);
+const sigmaGpuMove = (moves, budget, clock) => sigmaMoveKind('gpu', moves, budget, clock);
 
 // ---------------------------------------------------------------------------
 // Adapter: Ka (sugiyama2718/Quoridor, epoch4100 checkpoint — dedicated
@@ -553,9 +561,70 @@ const KA_ENDPOINTS = (process.env.KA_ARENA || 'http://169.254.152.37:9716/move,h
 const kaFlip = (mv) => (mv.length === 2
   ? mv[0] + String(10 - Number(mv[1]))
   : mv[0] + String(9 - Number(mv.slice(1, -1))) + mv[mv.length - 1]);
-let kaRate = 120; // nodes/sec EMA — CPU TF on a shared box; starts pessimistic
-async function kaMove(moves, budget) {
-  const nodes = Math.max(100, Math.min(6_000, Math.round(kaRate * Math.max(0.3, (budget - 300) / 1000))));
+// ---------------------------------------------------------------------------
+// FAIR BUDGETING for engines that take a NODE/SIM count instead of a clock.
+//
+// Audit 2026-08-25: ka, ka_gpu and sigma were the ONLY seats that ever flagged
+// — 28-32% of their games, against ~0% for every other engine — and their
+// move-time tails reached 90-175s against a 15s budget cap (sigma_gpu, same
+// search, had ZERO moves over 20s in 135k). Cause: the adapter converted the
+// time budget into a node count using the MEAN observed speed. These engines
+// cannot abort mid-search, so any request sized for the fast case runs to
+// completion — straight through the flag — whenever the shared box is slow.
+// The rating damage lands hardest in games the seat should win easily, which
+// is why a stronger engine (ka_gpu beats ka head-to-head) can rate lower.
+//
+// Fix: size every request from a PESSIMISTIC rate (the slow end of the recent
+// window, so one freak sample cannot pin it forever) and clamp the time that
+// request may occupy — by the move budget, by a fraction of the remaining
+// bank, and by an absolute per-move ceiling. Costs nodes in the fast case;
+// buys back games that were being lost on the clock.
+const MOVE_CEILING_MS = 20_000; // no single request may be sized beyond this
+
+class NodeBudget {
+  constructor(seed, floor, ceil, window = 24) {
+    this.seed = seed;
+    this.floor = floor;
+    this.ceil = ceil;
+    this.window = window;
+    this.rates = []; // realized nodes/sec, most recent last
+  }
+
+  /** Slow end of the recent window (20th percentile) — what a request must
+   *  survive. A rolling window means a contention spike ages out instead of
+   *  crippling the seat permanently. */
+  slowRate() {
+    if (!this.rates.length) return this.seed;
+    const sorted = [...this.rates].sort((a, b) => a - b);
+    return sorted[Math.floor(sorted.length * 0.2)];
+  }
+
+  observe(nodes, ms) {
+    if (!(nodes > 0) || !(ms > 0)) return;
+    this.rates.push((nodes * 1000) / ms);
+    while (this.rates.length > this.window) this.rates.shift();
+  }
+
+  /** A failed/timed-out move: we are slower than anything measured. */
+  penalize() {
+    this.rates = [Math.max(5, this.slowRate() / 2)];
+  }
+
+  /** Node count this engine can finish inside `budget` even at its worst
+   *  recent speed, never staking more than half the bank above the reserve. */
+  nodesFor(budgetMs, clock) {
+    const remaining = Number.isFinite(clock?.my_ms) ? clock.my_ms : Infinity;
+    const bankMs = Number.isFinite(remaining)
+      ? Math.max(200, (remaining - RESERVE_MS) * 0.5)
+      : Infinity;
+    const safeMs = Math.min(Math.max(200, budgetMs - 300), bankMs, MOVE_CEILING_MS);
+    return Math.max(this.floor, Math.min(this.ceil, Math.round((this.slowRate() * safeMs) / 1000)));
+  }
+}
+
+const kaBudget = new NodeBudget(120, 100, 6_000); // CPU TF on a shared box
+async function kaMove(moves, budget, clock) {
+  const nodes = kaBudget.nodesFor(budget, clock);
   const ep = KA_ENDPOINTS.find((e) => !e.busy) || KA_ENDPOINTS[0];
   ep.busy = true;
   const t0 = Date.now();
@@ -568,14 +637,14 @@ async function kaMove(moves, budget) {
     });
     j = await r.json();
   } catch (e) {
-    kaRate = Math.max(20, kaRate / 2); // overshot the box's real speed — adapt from failures too
+    kaBudget.penalize(); // overshot the box's real speed — adapt from failures too
     throw e;
   } finally {
     ep.busy = false;
   }
   if (!j.action) throw new Error('ka: ' + JSON.stringify(j).slice(0, 120));
   const dt = Math.max(0.05, (Date.now() - t0) / 1000);
-  kaRate = 0.7 * kaRate + 0.3 * (nodes / dt);
+  kaBudget.observe(j.nodes ?? nodes, dt * 1000);
   const ev = typeof j.value === 'number' ? Math.max(0, Math.min(1, (j.value + 1) / 2)) : null;
   return { n: kaFlip(j.action), ev, nodes: j.nodes ?? nodes, ms: Math.round(dt * 1000) };
 }
@@ -584,9 +653,9 @@ async function kaMove(moves, budget) {
 // (claustro-ka-gpu.service :9718). Own rate EMA — measured ~590 n/s warm.
 const KA_GPU_URL = process.env.KA_GPU_ARENA || 'http://169.254.152.37:9718/move';
 let kaGpuBusy = false;
-let kaGpuRate = 400; // nodes/sec EMA — starts below measured warm speed
-async function kaGpuMove(moves, budget) {
-  const nodes = Math.max(100, Math.min(12_000, Math.round(kaGpuRate * Math.max(0.3, (budget - 300) / 1000))));
+const kaGpuBudget = new NodeBudget(400, 100, 12_000); // GPU: fast, but spikes hard under co-tenancy
+async function kaGpuMove(moves, budget, clock) {
+  const nodes = kaGpuBudget.nodesFor(budget, clock);
   kaGpuBusy = true;
   const t0 = Date.now();
   let j;
@@ -598,14 +667,14 @@ async function kaGpuMove(moves, budget) {
     });
     j = await r.json();
   } catch (e) {
-    kaGpuRate = Math.max(50, kaGpuRate / 2);
+    kaGpuBudget.penalize();
     throw e;
   } finally {
     kaGpuBusy = false;
   }
   if (!j.action) throw new Error('ka_gpu: ' + JSON.stringify(j).slice(0, 120));
   const dt = Math.max(0.05, (Date.now() - t0) / 1000);
-  kaGpuRate = 0.7 * kaGpuRate + 0.3 * (nodes / dt);
+  kaGpuBudget.observe(j.nodes ?? nodes, dt * 1000);
   const ev = typeof j.value === 'number' ? Math.max(0, Math.min(1, (j.value + 1) / 2)) : null;
   return { n: kaFlip(j.action), ev, nodes: j.nodes ?? nodes, ms: Math.round(dt * 1000) };
 }
