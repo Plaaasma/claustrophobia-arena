@@ -5,7 +5,7 @@
 //   GET  /     -> {ok, pools}
 // Adapter code below is EXTRACTED VERBATIM from arena.mjs — keep in sync.
 import { setDefaultResultOrder } from 'node:dns';
-import { spawn } from 'node:child_process';
+import { execSync, spawn } from 'node:child_process';
 import { openSync, readFileSync } from 'node:fs';
 import { createContext, runInContext } from 'node:vm';
 import { createServer } from 'node:http';
@@ -18,6 +18,39 @@ const SITE = join(HERE, '..', 'site');
 const rules = await import(join(SITE, 'shared', 'rules.js').replaceAll(String.fromCharCode(92), '/'));
 const { initialState, replayMoves, allLegalMoves, isTerminal, winner, parseMove } = rules;
 const INC_MS = 2_000;
+
+// ---------------------------------------------------------------------------
+// PER-INSTANCE MEMORY CAP (2026-08-26, user directive: 4 GB per engine
+// instance). Pooled children share engine-host's cgroup, so a unit-level
+// MemoryMax cannot bound them individually — each child is launched in its own
+// transient systemd scope instead, which gives it a private memory.max.
+// Exceeding it OOM-kills that one engine: the arena scores it as an engine
+// failure and VOIDS the pair, so a runaway costs nobody Elo.
+//
+// Docker-backed engines are deliberately NOT wrapped: the container's memory
+// lives in dockerd's cgroup, not this scope, and `docker run --memory` is
+// exactly what broke CUDA init on this GB10 before (kya, 2026-08-11).
+const ENGINE_MEM_MAX = process.env.ENGINE_MEM_MAX || '4G';
+const SCOPE_OK = (() => {
+  if (process.env.ENGINE_MEM_CAP === '0') return false;
+  try {
+    execSync(`systemd-run --user --scope -q -p MemoryMax=${ENGINE_MEM_MAX} -- /bin/true`,
+      { stdio: 'ignore', timeout: 10_000 });
+    return true;
+  } catch {
+    console.log('[host] systemd scopes unavailable — engines run uncapped');
+    return false;
+  }
+})();
+console.log(`[host] per-instance memory cap: ${SCOPE_OK ? ENGINE_MEM_MAX : 'off'}`);
+
+/** spawn() with a private memory cap, falling back to a bare spawn. */
+function spawnCapped(cmd, args, opts) {
+  if (!SCOPE_OK) return spawn(cmd, args, opts);
+  return spawn('systemd-run',
+    ['--user', '--scope', '-q', '--collect', '-p', `MemoryMax=${ENGINE_MEM_MAX}`, '--', cmd, ...args],
+    opts);
+}
 
 
 // Adapter: ACE QBR — NATIVE aarch64 build from the zip's rust source (the
@@ -41,7 +74,7 @@ function qbrStateOf(st) {
 // centipawn (side-to-move frame) -> rough win prob, chess-style logistic
 const cpToEv = (cp) => 1 / (1 + Math.pow(10, -cp / 400));
 function makeQbr() {
-  const child = spawn(QBR_BIN_NATIVE, ['qbp', '--feature', `nnue3=${QBR_NNUE}`, '--feature', 'wallq_tc=off', '--feature', 'rfp_margin=50', '--feature', 'threads=1'],
+  const child = spawnCapped(QBR_BIN_NATIVE, ['qbp', '--feature', `nnue3=${QBR_NNUE}`, '--feature', 'wallq_tc=off', '--feature', 'rfp_margin=50', '--feature', 'threads=1'],
     { stdio: ['pipe', 'pipe', 'pipe'] });
   let buf = '';
   let ebuf = '';
@@ -172,7 +205,7 @@ async function claustroV1Move(moves, budget) {
 
 const TITANIUM_BIN = join(process.env.HOME, 'arena-engines', 'titanium-engine', 'target', 'release', 'titanium');
 function makeTitanium() {
-  const child = spawn(TITANIUM_BIN, ['session', '--engine', 'titanium-v17'], { stdio: ['pipe', 'pipe', 'pipe'] });
+  const child = spawnCapped(TITANIUM_BIN, ['session', '--engine', 'titanium-v17'], { stdio: ['pipe', 'pipe', 'pipe'] });
   let buf = '';
   let lastNodes = null;
   let lastScore = null;
@@ -288,7 +321,7 @@ function sigmaSpawn(kind) {
     try { sigmaErrFd = openSync(join(process.env.HOME, 'arena-engines', 'sigma_worker.err'), 'a'); }
     catch { sigmaErrFd = 'ignore'; }
   }
-  const c = spawn('python3', [join(process.env.HOME, 'arena-engines', 'sigma_worker.py')],
+  const c = spawnCapped('python3', [join(process.env.HOME, 'arena-engines', 'sigma_worker.py')],
     {
       stdio: ['pipe', 'pipe', sigmaErrFd ?? 'ignore'],
       env: kind === 'gpu' ? { ...process.env, SIGMA_DEVICE: 'cuda' } : process.env,
@@ -357,7 +390,7 @@ const sigmaGpuMove = (moves, budget) => sigmaMoveKind('gpu', moves, budget);
 const SIMPLE_DIR = join(process.env.HOME, 'arena-engines', 'simple');
 const SIMPLE_RULES = join(process.env.HOME, 'Claustrophobia', 'site', 'shared', 'rules.js');
 function makeSimple(key) {
-  const child = spawn(process.execPath, [join(SIMPLE_DIR, `${key}.mjs`)],
+  const child = spawnCapped(process.execPath, [join(SIMPLE_DIR, `${key}.mjs`)],
     { stdio: ['pipe', 'pipe', 'ignore'], env: { ...process.env, QUORIDOR_RULES: SIMPLE_RULES } });
   let buf = '';
   const waiters = [];
@@ -491,7 +524,7 @@ function makeIshtar2() {
 // tablebase. It does its own clock budgeting (mtg=24) from the clock we
 // pass. NO ev is returned by design — the seat runs without an eval bar.
 function makeAceKya() {
-  const child = spawn('python3', ['se24_server.py'], {
+  const child = spawnCapped('python3', ['se24_server.py'], {
     cwd: join(process.env.HOME, 'arena-engines', 'se24'),
     stdio: ['pipe', 'pipe', 'ignore'],
   });
@@ -534,7 +567,7 @@ function makeAceKya() {
 // render). The mirror is its own inverse.
 const toZq = (m) => (m.length === 3 ? `${m[0]}${9 - Number(m[1])}${m[2]}` : `${m[0]}${10 - Number(m[1])}`);
 function makeZquoridor() {
-  const child = spawn(join(process.env.HOME, 'arena-engines', 'zquoridor', 'bin', 'qtp_engine'),
+  const child = spawnCapped(join(process.env.HOME, 'arena-engines', 'zquoridor', 'bin', 'qtp_engine'),
     [join(process.env.HOME, 'arena-engines', 'zquoridor', 'data', 'nnue', 'nnue_weights_int8.bin'), '40', '200'],
     { cwd: join(process.env.HOME, 'arena-engines', 'zquoridor'), stdio: ['pipe', 'pipe', 'ignore'] });
   let buf = '';

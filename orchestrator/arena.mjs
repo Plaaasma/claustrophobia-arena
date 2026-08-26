@@ -11,7 +11,7 @@
 
 import { setDefaultResultOrder } from 'node:dns';
 import { setDefaultAutoSelectFamilyAttemptTimeout } from 'node:net';
-import { spawn } from 'node:child_process';
+import { execSync, spawn } from 'node:child_process';
 
 // Remote-engine transport hygiene (diagnosed with the nmbf author 2026-08-11):
 // this host has NO global IPv6 route, so AAAA legs die instantly with
@@ -40,6 +40,39 @@ const BASE_MS = 180_000;         // 3 minutes
 const INC_MS = 2_000;            // +2s per move
 const MOVE_CAP = 400;            // ply cap → draw
 const K = 24;                    // Elo K-factor
+
+// ---------------------------------------------------------------------------
+// PER-INSTANCE MEMORY CAP (2026-08-26, user directive: 4 GB per engine
+// instance). Pooled children share engine-host's cgroup, so a unit-level
+// MemoryMax cannot bound them individually — each child is launched in its own
+// transient systemd scope instead, which gives it a private memory.max.
+// Exceeding it OOM-kills that one engine: the arena scores it as an engine
+// failure and VOIDS the pair, so a runaway costs nobody Elo.
+//
+// Docker-backed engines are deliberately NOT wrapped: the container's memory
+// lives in dockerd's cgroup, not this scope, and `docker run --memory` is
+// exactly what broke CUDA init on this GB10 before (kya, 2026-08-11).
+const ENGINE_MEM_MAX = process.env.ENGINE_MEM_MAX || '4G';
+const SCOPE_OK = (() => {
+  if (process.env.ENGINE_MEM_CAP === '0') return false;
+  try {
+    execSync(`systemd-run --user --scope -q -p MemoryMax=${ENGINE_MEM_MAX} -- /bin/true`,
+      { stdio: 'ignore', timeout: 10_000 });
+    return true;
+  } catch {
+    console.log('[arena] systemd scopes unavailable — engines run uncapped');
+    return false;
+  }
+})();
+console.log(`[arena] per-instance memory cap: ${SCOPE_OK ? ENGINE_MEM_MAX : 'off'}`);
+
+/** spawn() with a private memory cap, falling back to a bare spawn. */
+function spawnCapped(cmd, args, opts) {
+  if (!SCOPE_OK) return spawn(cmd, args, opts);
+  return spawn('systemd-run',
+    ['--user', '--scope', '-q', '--collect', '-p', `MemoryMax=${ENGINE_MEM_MAX}`, '--', cmd, ...args],
+    opts);
+}
 
 // ---------------------------------------------------------------------------
 // DB schema
@@ -198,7 +231,7 @@ function qbrStateOf(st) {
 // centipawn (side-to-move frame) -> rough win prob, chess-style logistic
 const cpToEv = (cp) => 1 / (1 + Math.pow(10, -cp / 400));
 function makeQbr() {
-  const child = spawn(QBR_BIN_NATIVE, ['qbp', '--feature', `nnue3=${QBR_NNUE}`, '--feature', 'wallq_tc=off', '--feature', 'rfp_margin=50', '--feature', 'threads=1'],
+  const child = spawnCapped(QBR_BIN_NATIVE, ['qbp', '--feature', `nnue3=${QBR_NNUE}`, '--feature', 'wallq_tc=off', '--feature', 'rfp_margin=50', '--feature', 'threads=1'],
     { stdio: ['pipe', 'pipe', 'pipe'] });
   let buf = '';
   let ebuf = '';
@@ -368,7 +401,7 @@ async function claustroCpuMove(moves, budget, clock) {
 
 const TITANIUM_BIN = join(process.env.HOME, 'arena-engines', 'titanium-engine', 'target', 'release', 'titanium');
 function makeTitanium() {
-  const child = spawn(TITANIUM_BIN, ['session', '--engine', 'titanium-v17'], { stdio: ['pipe', 'pipe', 'pipe'] });
+  const child = spawnCapped(TITANIUM_BIN, ['session', '--engine', 'titanium-v17'], { stdio: ['pipe', 'pipe', 'pipe'] });
   let buf = '';
   let lastNodes = null;
   let lastScore = null;
@@ -482,7 +515,7 @@ function sigmaSpawn(kind) {
     try { sigmaErrFd = openSync(join(process.env.HOME, 'arena-engines', 'sigma_worker.err'), 'a'); }
     catch { sigmaErrFd = 'ignore'; }
   }
-  const c = spawn('python3', [join(process.env.HOME, 'arena-engines', 'sigma_worker.py')],
+  const c = spawnCapped('python3', [join(process.env.HOME, 'arena-engines', 'sigma_worker.py')],
     {
       stdio: ['pipe', 'pipe', sigmaErrFd ?? 'ignore'],
       env: kind === 'gpu' ? { ...process.env, SIGMA_DEVICE: 'cuda' } : process.env,
@@ -579,10 +612,12 @@ const kaFlip = (mv) => (mv.length === 2
 // request may occupy — by the move budget, by a fraction of the remaining
 // bank, and by an absolute per-move ceiling. Costs nodes in the fast case;
 // buys back games that were being lost on the clock.
-const MOVE_CEILING_MS = 20_000; // no single request may be sized beyond this
+// Sized down from 20s after measurement (2026-08-25): with a 15s budget cap,
+// a request sized for 20s is already outside anything the clock rule intends.
+const MOVE_CEILING_MS = 12_000; // no single request may be sized beyond this
 
 class NodeBudget {
-  constructor(seed, floor, ceil, window = 24) {
+  constructor(seed, floor, ceil, window = 12) {
     this.seed = seed;
     this.floor = floor;
     this.ceil = ceil;
@@ -590,13 +625,18 @@ class NodeBudget {
     this.rates = []; // realized nodes/sec, most recent last
   }
 
-  /** Slow end of the recent window (20th percentile) — what a request must
-   *  survive. A rolling window means a contention spike ages out instead of
-   *  crippling the seat permanently. */
+  /** The WORST rate in the recent window — what a request must survive.
+   *
+   *  A percentile was tried first and was not enough: these boxes spike as far
+   *  as 7x below their own 20th percentile (measured: ka still overshot on 27%
+   *  of moves, ka_gpu took a 147s move), because no percentile of past speed
+   *  bounds a contention tail. Sizing to the worst sample makes the seat
+   *  self-correct — one slow move shrinks the next requests by the same factor
+   *  it was slowed — and the short rolling window lets it recover as the spike
+   *  ages out. Nodes are worthless in a game lost on the clock. */
   slowRate() {
     if (!this.rates.length) return this.seed;
-    const sorted = [...this.rates].sort((a, b) => a - b);
-    return sorted[Math.floor(sorted.length * 0.2)];
+    return Math.min(...this.rates);
   }
 
   observe(nodes, ms) {
@@ -687,7 +727,7 @@ async function kaGpuMove(moves, budget, clock) {
 const SIMPLE_DIR = join(process.env.HOME, 'arena-engines', 'simple');
 const SIMPLE_RULES = join(process.env.HOME, 'Claustrophobia', 'site', 'shared', 'rules.js');
 function makeSimple(key) {
-  const child = spawn(process.execPath, [join(SIMPLE_DIR, `${key}.mjs`)],
+  const child = spawnCapped(process.execPath, [join(SIMPLE_DIR, `${key}.mjs`)],
     { stdio: ['pipe', 'pipe', 'ignore'], env: { ...process.env, QUORIDOR_RULES: SIMPLE_RULES } });
   let buf = '';
   const waiters = [];
