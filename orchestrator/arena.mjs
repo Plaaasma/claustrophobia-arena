@@ -104,7 +104,7 @@ try { db.exec('ALTER TABLE arena_bots ADD COLUMN offline INTEGER NOT NULL DEFAUL
 
 const ROSTER = [
   { key: 'claustrophobia', name: 'Claustrophobia v2' },
-  { key: 'titanium', name: 'Titanium v19.8.2' }, // 12532da — ships gated champion net f430f608; repo says 19.8.2 (owner said 19.8.3)
+  { key: 'titanium', name: 'Titanium v19.8.9' }, // built on both boxes 2026-08-26
   { key: 'gorisanson', name: 'Gorisanson 0.3' },
   { key: 'qbr', name: 'ACE QBR' }, // per the authors: neutral name, not "Ace One"
   { key: 'ishtar', name: 'ACE Ishtar 16' }, // claustro-ishnat*.service — native harness (extracted net + search, ORT CPU)
@@ -863,7 +863,12 @@ function makeHosted(key) {
     kill() {},
   };
 }
-const HOSTED = new Set(['titanium', 'qbr', 'gorisanson', 'sigma', 'sigma_gpu', 'pathfinder', 'scout', 'sentinel', 'ishtar2', 'zquoridor']);
+// LOAD SPLIT (2026-08-26): spark1 carried ~22GB of arena engines against
+// spark2's ~4GB. CPU-only engines now run on the orchestrator box (spark2),
+// where their installs already lived; GPU and container engines stay on spark1
+// so the site's GPU is not disturbed. Keep pool caps in LIMITS matching
+// whichever side runs them.
+const HOSTED = new Set(['sigma_gpu', 'ishtar2', 'zquoridor']);
 
 // ---------------------------------------------------------------------------
 // Adapter: ACE Kya (se24-cpu arena_server.py — the author's own HTTP server
@@ -1310,6 +1315,9 @@ selfTest();
 qbrProbe().catch((e) => console.log(`[arena] qbr probe FAILED: ${e.message}`));
 // pre-warm sigma workers (both pools) — torch import + first inference is ~15s cold
 for (const [kind, cap] of [['cpu', LIMITS.sigma || 1], ['gpu', LIMITS.sigma_gpu || 1]]) {
+  // skip pools served by the engine host — warming them here just
+  // parks idle torch processes (measured 3.1GB of them on spark2)
+  if (HOSTED.has(kind === 'cpu' ? 'sigma' : 'sigma_gpu')) continue;
   for (let i = 0; i < cap; i++) {
     sigmaMoveKind(kind, ['e2', 'e8'], 2000).then(
       (r) => console.log(`[arena] sigma ${kind} worker ${i} warm (${r.n})`),
